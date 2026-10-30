@@ -30,6 +30,12 @@ never refreshes a token itself: rotating an inactive slot's refresh token
 without persisting the result would leave that slot holding a consumed token.
 The usage collector refreshes tokens on its own schedule, and a due plan whose
 token is not valid yet simply waits for the next pass.
+
+A response is only believed once its account and organization UUIDs match the
+slot: the token in a slot is not proof of whose it is. A failed or mismatched
+read sets ``retryAt`` beside the record and leaves ``fetchedAt`` alone, so the
+label keeps the age of the last real reading and the endpoint is not asked
+again on every snapshot.
 """
 
 from __future__ import annotations
@@ -37,12 +43,13 @@ from __future__ import annotations
 import json
 import logging
 import time
-import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap import oauth
+from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
 _logger = logging.getLogger("claude-swap")
@@ -54,6 +61,12 @@ PLAN_FILENAME = "subscription_plans.json"
 # visible the same day without adding meaningful traffic: one profile call per
 # account four times a day.
 PLAN_TTL_S = 6 * 3600
+
+# After a failed read: at least this long, longer if the server says so. A
+# Retry-After of 0 is real on this API (#220), so it cannot be the only floor.
+FAILURE_RETRY_S = 15 * 60
+# Ceiling on any wait, and the bound past which a stored retryAt is clock skew.
+MAX_RETRY_S = 24 * 3600
 
 FREE_TIER = "default_claude_ai"
 
@@ -79,8 +92,18 @@ _KEPT_FIELDS = (
 )
 
 
-def fetch_plan(access_token: str, timeout: float = 5.0) -> dict | None:
-    """The plan fields of ``/api/oauth/profile``, or None on any failure.
+@dataclass(frozen=True)
+class PlanFetch:
+    """One profile read. ``plan`` is None on any failure."""
+
+    plan: dict | None = None
+    account_uuid: str = ""
+    organization_uuid: str = ""
+    retry_after_s: float | None = None
+
+
+def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
+    """Read the plan fields of ``/api/oauth/profile``.
 
     Requires a non-empty ``rate_limit_tier``, the field every label derives
     from; a response without one is treated as no answer rather than as a plan
@@ -100,19 +123,53 @@ def fetch_plan(access_token: str, timeout: float = 5.0) -> dict | None:
             data = json.loads(resp.read().decode())
     except Exception as e:  # noqa: BLE001 — display-only; never let it surface
         _logger.debug("Plan fetch failed: %r", e)
-        return None
+        _kind, retry_after_s = oauth._classify_usage_error(e)
+        return PlanFetch(retry_after_s=retry_after_s)
     organization = data.get("organization") if isinstance(data, dict) else None
     if not isinstance(organization, dict):
-        return None
+        return PlanFetch()
     tier = organization.get("rate_limit_tier")
     if not isinstance(tier, str) or not tier:
-        return None
+        return PlanFetch()
     plan = {"tier": tier}
     for source, key in _KEPT_FIELDS:
         value = organization.get(source)
         if isinstance(value, str) and value:
             plan[key] = value
-    return plan
+    account = data.get("account")
+    account_uuid = account.get("uuid") if isinstance(account, dict) else None
+    organization_uuid = organization.get("uuid")
+    return PlanFetch(
+        plan=plan,
+        account_uuid=account_uuid if isinstance(account_uuid, str) else "",
+        organization_uuid=(
+            organization_uuid if isinstance(organization_uuid, str) else ""
+        ),
+    )
+
+
+def matches_slot(fetched: PlanFetch, account_uuid: str, org_uuid: str) -> bool:
+    """Whether a read provably belongs to the slot it was made for.
+
+    Every UUID the slot records must match, and at least one must exist: a slot
+    recording neither cannot confirm anything, so it shows no plan rather than
+    one that may be another account's.
+    """
+    expected = [
+        (recorded, seen)
+        for recorded, seen in (
+            (account_uuid, fetched.account_uuid),
+            (org_uuid, fetched.organization_uuid),
+        )
+        if recorded
+    ]
+    return bool(expected) and all(recorded == seen for recorded, seen in expected)
+
+
+def next_retry_at(now: float, retry_after_s: float | None) -> float:
+    """When a failed read may be repeated."""
+    wait = max(FAILURE_RETRY_S, retry_after_s or 0.0)
+    return now + min(wait, MAX_RETRY_S)
 
 
 def plan_label(plan: dict | None) -> str | None:
@@ -165,22 +222,56 @@ def valid_record(record: object) -> bool:
     )
 
 
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def is_due(record: object, now: float, ttl: float = PLAN_TTL_S) -> bool:
-    """Whether a record needs refreshing. A future stamp is clock skew: refresh."""
+    """Whether a record needs refreshing. A future stamp is clock skew: refresh.
+
+    A live ``retryAt`` holds the read back whatever the age of the plan; one
+    further out than any wait this module sets is skew and is ignored.
+    """
+    if isinstance(record, dict):
+        retry_at = record.get("retryAt")
+        if _is_number(retry_at) and now < retry_at <= now + MAX_RETRY_S:
+            return False
     if not valid_record(record):
         return True
     fetched_at = record["fetchedAt"]
     return fetched_at > now or now - fetched_at >= ttl
 
 
-class PlanStore:
-    """``subscription_plans.json``: ``{identity_key: {"plan": {...}, "fetchedAt": epoch}}``.
+def _merge(existing: object, update: dict) -> dict:
+    """One key of a save. The newer reading wins, whichever process lands last.
 
-    No lock. Several processes (``list``, ``watch``, the menu bar) may refresh
-    at once, so ``save`` re-reads and merges just before its atomic write: two
-    writers refreshing different accounts both land, and the worst a true race
-    costs is one extra profile call on the next pass. A lock would also force
-    the network call outside it anyway, which is the shape this already has.
+    ``update`` is a success (``plan``, ``fetchedAt``) or a failure (``retryAt``,
+    ``attemptedAt``). Both are stamped before their request went out, so an
+    answer that was slow to arrive cannot pass for a newer one.
+    """
+    current = existing if isinstance(existing, dict) else {}
+    if "plan" in update:
+        if valid_record(current) and current["fetchedAt"] > update["fetchedAt"]:
+            return current
+        attempted_at = current.get("attemptedAt")
+        if _is_number(attempted_at) and attempted_at > update["fetchedAt"]:
+            return {
+                **update,
+                "retryAt": current.get("retryAt"),
+                "attemptedAt": attempted_at,
+            }
+        return update
+    if valid_record(current) and current["fetchedAt"] >= update["attemptedAt"]:
+        return current
+    return {**current, **update}
+
+
+class PlanStore:
+    """``subscription_plans.json``: ``{identity_key: record}``.
+
+    ``list``, ``watch`` and the auto view may refresh at once. ``save`` holds a
+    lock across its read/merge/write, and only that: the network calls happen
+    before it, so the lock is short and never waits on a slow response.
     """
 
     def __init__(self, path: Path, clock: Callable[[], float] = time.time):
@@ -195,7 +286,9 @@ class PlanStore:
         return raw if isinstance(raw, dict) else {}
 
     def save(self, updates: dict[str, dict]) -> None:
-        merged = self.load()
-        merged.update(updates)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(self.path, merged)
+        with FileLock(self.path.with_name(self.path.name + ".lock")):
+            merged = self.load()
+            for key, update in updates.items():
+                merged[key] = _merge(merged.get(key), update)
+            atomic_write_json(self.path, merged)

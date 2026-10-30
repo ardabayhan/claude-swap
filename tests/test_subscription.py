@@ -49,6 +49,12 @@ def _creds(token: str | None = "tok", expires_ms: int | None = None) -> str:
     return json.dumps({"claudeAiOauth": blob})
 
 
+def _ok(plan: dict, org: str = "o1", account: str = "") -> subscription.PlanFetch:
+    return subscription.PlanFetch(
+        plan=plan, account_uuid=account, organization_uuid=org
+    )
+
+
 def _future_ms() -> int:
     return int((time.time() + 3600) * 1000)
 
@@ -78,21 +84,23 @@ class TestFetchPlan:
                 "billing_type": "stripe_subscription",
                 "subscription_status": "active",
                 "name": "not kept",
-                "uuid": "not kept",
+                "uuid": "o",
             },
         }
         with patch("urllib.request.urlopen", return_value=_response(payload)):
-            assert subscription.fetch_plan("tok") == TEAM
+            result = subscription.fetch_plan("tok")
+        assert result.plan == TEAM
+        assert (result.account_uuid, result.organization_uuid) == ("u", "o")
 
     def test_no_tier_is_no_answer(self):
         payload = {"organization": {"billing_type": "stripe_subscription"}}
         with patch("urllib.request.urlopen", return_value=_response(payload)):
-            assert subscription.fetch_plan("tok") is None
+            assert subscription.fetch_plan("tok").plan is None
 
     def test_empty_tier_is_no_answer(self):
         payload = {"organization": {"rate_limit_tier": ""}}
         with patch("urllib.request.urlopen", return_value=_response(payload)):
-            assert subscription.fetch_plan("tok") is None
+            assert subscription.fetch_plan("tok").plan is None
 
     def test_non_string_fields_are_dropped_not_kept(self):
         payload = {
@@ -103,7 +111,7 @@ class TestFetchPlan:
             }
         }
         with patch("urllib.request.urlopen", return_value=_response(payload)):
-            assert subscription.fetch_plan("tok") == {"tier": "default_claude_ai"}
+            assert subscription.fetch_plan("tok").plan == {"tier": "default_claude_ai"}
 
     @pytest.mark.parametrize(
         "error",
@@ -115,20 +123,29 @@ class TestFetchPlan:
     )
     def test_any_transport_failure_is_none(self, error):
         with patch("urllib.request.urlopen", side_effect=error):
-            assert subscription.fetch_plan("tok") is None
+            assert subscription.fetch_plan("tok").plan is None
+
+    def test_retry_after_is_carried_out_of_a_429(self):
+        error = urllib.error.HTTPError(
+            "u", 429, "Too Many", {"Retry-After": "3600"}, None
+        )
+        with patch("urllib.request.urlopen", side_effect=error):
+            result = subscription.fetch_plan("tok")
+        assert result.plan is None
+        assert result.retry_after_s == 3600.0
 
     def test_malformed_body_is_none(self):
         body = io.BytesIO(b"not json")
         body.__enter__ = lambda self=body: self  # type: ignore[attr-defined]
         body.__exit__ = lambda *a: None  # type: ignore[attr-defined]
         with patch("urllib.request.urlopen", return_value=body):
-            assert subscription.fetch_plan("tok") is None
+            assert subscription.fetch_plan("tok").plan is None
 
     def test_non_dict_organization_is_none(self):
         with patch(
             "urllib.request.urlopen", return_value=_response({"organization": []})
         ):
-            assert subscription.fetch_plan("tok") is None
+            assert subscription.fetch_plan("tok").plan is None
 
 
 # --- label and expiry ---------------------------------------------------------
@@ -219,10 +236,47 @@ class TestRecords:
         assert not subscription.valid_record(record)
         assert subscription.is_due(record, now=1000.0)
 
+    def test_a_live_retry_holds_an_overdue_record(self):
+        record = {"plan": TEAM, "fetchedAt": 0.0, "retryAt": 2000.0}
+        assert not subscription.is_due(record, now=1000.0)
+
+    def test_a_passed_retry_does_not_hold_it(self):
+        now = subscription.PLAN_TTL_S + 1000.0
+        record = {"plan": TEAM, "fetchedAt": 0.0, "retryAt": now - 1}
+        assert subscription.is_due(record, now=now)
+
+    def test_an_impossibly_distant_retry_is_skew(self):
+        now = subscription.PLAN_TTL_S + 1000.0
+        record = {"plan": TEAM, "fetchedAt": 0.0, "retryAt": 1e12}
+        assert subscription.is_due(record, now=now)
+
     def test_identity_key_separates_organizations(self):
         assert subscription.identity_key("a@x", "org-1") != (
             subscription.identity_key("a@x", "org-2")
         )
+
+
+class TestMatchesSlot:
+    @pytest.mark.parametrize(
+        "uuid, org, expected",
+        [
+            ("a", "o", True),
+            ("a", "", True),
+            ("", "o", True),
+            ("x", "o", False),
+            ("a", "x", False),
+            ("", "", False),
+        ],
+    )
+    def test_every_recorded_uuid_must_match(self, uuid, org, expected):
+        fetched = subscription.PlanFetch(
+            plan=TEAM, account_uuid="a", organization_uuid="o"
+        )
+        assert subscription.matches_slot(fetched, uuid, org) is expected
+
+    def test_a_recorded_uuid_the_response_lacks_does_not_match(self):
+        fetched = subscription.PlanFetch(plan=TEAM, organization_uuid="o")
+        assert not subscription.matches_slot(fetched, "a", "o")
 
 
 class TestUsableAccessToken:
@@ -257,6 +311,46 @@ class TestPlanStore:
         first.save({"a": {"plan": TEAM, "fetchedAt": 1.0}})
         second.save({"b": {"plan": LAPSED, "fetchedAt": 2.0}})
         assert set(first.load()) == {"a", "b"}
+
+    def test_an_older_answer_cannot_replace_a_newer_plan(self, tmp_path: Path):
+        store = subscription.PlanStore(tmp_path / "p.json")
+        store.save({"k": {"plan": LAPSED, "fetchedAt": 200.0}})
+        store.save({"k": {"plan": ACTIVE_MAX, "fetchedAt": 100.0}})
+        assert store.load()["k"]["plan"] == LAPSED
+
+    def test_an_older_failure_cannot_back_off_a_newer_reading(self, tmp_path: Path):
+        store = subscription.PlanStore(tmp_path / "p.json")
+        store.save({"k": {"plan": TEAM, "fetchedAt": 200.0}})
+        store.save({"k": {"retryAt": 900.0, "attemptedAt": 100.0}})
+        assert "retryAt" not in store.load()["k"]
+
+    def test_a_failure_keeps_the_plan_it_failed_to_replace(self, tmp_path: Path):
+        store = subscription.PlanStore(tmp_path / "p.json")
+        store.save({"k": {"plan": TEAM, "fetchedAt": 100.0}})
+        store.save({"k": {"retryAt": 900.0, "attemptedAt": 200.0}})
+        record = store.load()["k"]
+        assert record["plan"] == TEAM
+        assert record["fetchedAt"] == 100.0
+        assert record["retryAt"] == 900.0
+
+    def test_writers_cannot_interleave_a_read_merge_write(self, tmp_path: Path):
+        import threading
+
+        path = tmp_path / "p.json"
+
+        def write(key: str) -> None:
+            subscription.PlanStore(path).save(
+                {key: {"plan": TEAM, "fetchedAt": 1.0}}
+            )
+
+        threads = [
+            threading.Thread(target=write, args=(f"k{i}",)) for i in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert len(subscription.PlanStore(path).load()) == 8
 
     def test_corrupt_file_reads_as_empty(self, tmp_path: Path):
         path = tmp_path / "p.json"
@@ -296,7 +390,7 @@ class TestCollector:
     def test_fetches_a_due_slot_and_stores_it(self, switcher, monkeypatch):
         calls = []
         monkeypatch.setattr(
-            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or TEAM
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(TEAM)
         )
         plans = switcher._collect_subscription_plans(
             [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
@@ -306,48 +400,141 @@ class TestCollector:
         assert plans["1"]["fetchedAt"] == 1_000_000.0
 
     def test_a_fresh_record_is_served_without_a_call(self, switcher, monkeypatch):
-        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: TEAM)
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(TEAM))
         info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
         switcher._collect_subscription_plans(info)
 
         calls = []
         monkeypatch.setattr(
-            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or LAPSED
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(LAPSED)
         )
         switcher._usage_store.clock.now += 60
         plans = switcher._collect_subscription_plans(info)
         assert calls == []
         assert plans["1"]["plan"] == TEAM
 
-    def test_a_failed_fetch_keeps_the_last_record_and_does_not_advance_it(
+    def test_a_failed_fetch_keeps_the_reading_and_backs_off(
         self, switcher, monkeypatch
     ):
-        """The stuck-label case: a failure must neither erase the plan nor
-        stamp it fresh — stamping would postpone the retry by a whole TTL."""
+        """The last good plan and its age survive, and the endpoint is left
+        alone until the retry time rather than asked on every snapshot."""
         info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
-        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: TEAM)
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(TEAM))
         switcher._collect_subscription_plans(info)
-
-        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: None)
-        switcher._usage_store.clock.now += subscription.PLAN_TTL_S
-        plans = switcher._collect_subscription_plans(info)
-        assert plans["1"] == {"plan": TEAM, "fetchedAt": 1_000_000.0}
 
         calls = []
         monkeypatch.setattr(
-            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or LAPSED
+            subscription,
+            "fetch_plan",
+            lambda t, *a, **k: calls.append(t) or subscription.PlanFetch(),
         )
-        switcher._usage_store.clock.now += 60
+        switcher._usage_store.clock.now += subscription.PLAN_TTL_S
         plans = switcher._collect_subscription_plans(info)
-        assert calls == ["live"], "the failure must leave the record due"
+        assert plans["1"]["plan"] == TEAM
+        assert plans["1"]["fetchedAt"] == 1_000_000.0
+
+        switcher._usage_store.clock.now += 60
+        switcher._collect_subscription_plans(info)
+        assert calls == ["live"], "a failure must back off, not retry every pass"
+
+        switcher._usage_store.clock.now += subscription.FAILURE_RETRY_S
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: _ok(LAPSED)
+        )
+        plans = switcher._collect_subscription_plans(info)
         assert plans["1"]["plan"] == LAPSED
+        assert "retryAt" not in plans["1"]
+
+    def test_retry_after_outlasts_the_default_backoff(self, switcher, monkeypatch):
+        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        calls = []
+        monkeypatch.setattr(
+            subscription,
+            "fetch_plan",
+            lambda t, *a, **k: calls.append(t)
+            or subscription.PlanFetch(retry_after_s=7200.0),
+        )
+        switcher._collect_subscription_plans(info)
+        switcher._usage_store.clock.now += subscription.FAILURE_RETRY_S + 1
+        switcher._collect_subscription_plans(info)
+        assert len(calls) == 1
+        switcher._usage_store.clock.now += 7200
+        switcher._collect_subscription_plans(info)
+        assert len(calls) == 2
+
+    def test_a_zero_retry_after_still_gets_the_floor(self):
+        assert subscription.next_retry_at(100.0, 0.0) == (
+            100.0 + subscription.FAILURE_RETRY_S
+        )
+
+    def test_a_response_for_another_organization_is_not_kept(
+        self, switcher, monkeypatch
+    ):
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: _ok(LAPSED, org="other")
+        )
+        plans = switcher._collect_subscription_plans(
+            [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        )
+        assert plans == {}
+        record = switcher._subscription_store().load()[
+            subscription.identity_key("a@x", "o1")
+        ]
+        assert "plan" not in record and "retryAt" in record
+
+    def test_a_response_for_another_account_is_not_kept(self, switcher, monkeypatch):
+        monkeypatch.setattr(
+            switcher,
+            "_get_sequence_data",
+            lambda: {"accounts": {"1": {"uuid": "mine"}}},
+        )
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: _ok(LAPSED, account="theirs")
+        )
+        plans = switcher._collect_subscription_plans(
+            [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        )
+        assert plans == {}
+
+    def test_the_fallback_read_uses_the_display_cache(self, switcher, monkeypatch):
+        """Otherwise every pass repeats a Keychain read per expired slot."""
+        seen = []
+        monkeypatch.setattr(
+            switcher,
+            "_read_account_credentials",
+            lambda num, email, **k: seen.append(k) or _creds("x", _past_ms()),
+        )
+        switcher._collect_subscription_plans(
+            [_info(2, "b@x", "o1", False, _creds("stale", _past_ms()))]
+        )
+        assert seen == [{"cached": True}]
+
+    def test_an_empty_fetch_set_reads_stored_plans_only(self, switcher, monkeypatch):
+        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(TEAM))
+        switcher._collect_subscription_plans(info)
+        switcher._usage_store.clock.now += subscription.PLAN_TTL_S + 1
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: pytest.fail("network")
+        )
+        assert switcher._plans_for_pass(info, set())["1"]["plan"] == TEAM
+
+    def test_a_restricted_fetch_set_still_refreshes(self, switcher, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(TEAM)
+        )
+        switcher._plans_for_pass(
+            [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))], {"2"}
+        )
+        assert calls == ["live"]
 
     def test_inactive_slot_rereads_a_token_the_usage_pass_refreshed(
         self, switcher, monkeypatch
     ):
         calls = []
         monkeypatch.setattr(
-            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or TEAM
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(TEAM)
         )
         monkeypatch.setattr(
             switcher,
@@ -362,7 +549,7 @@ class TestCollector:
     def test_no_valid_token_means_no_call_and_no_record(self, switcher, monkeypatch):
         calls = []
         monkeypatch.setattr(
-            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or TEAM
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(TEAM)
         )
         monkeypatch.setattr(
             switcher,
@@ -380,7 +567,7 @@ class TestCollector:
     ):
         """The live store is the active slot's truth; its backup may be older."""
         read = []
-        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: TEAM)
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(TEAM))
         monkeypatch.setattr(
             switcher,
             "_read_account_credentials",
@@ -394,7 +581,7 @@ class TestCollector:
     def test_a_slot_without_oauth_is_skipped(self, switcher, monkeypatch):
         calls = []
         monkeypatch.setattr(
-            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or TEAM
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(TEAM)
         )
         monkeypatch.setattr(
             switcher, "_read_account_credentials", lambda num, email, **k: "sk-ant-api"
@@ -407,7 +594,7 @@ class TestCollector:
     def test_the_record_follows_the_identity_when_slots_are_renumbered(
         self, switcher, monkeypatch
     ):
-        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: LAPSED)
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(LAPSED))
         switcher._collect_subscription_plans(
             [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
         )
@@ -420,7 +607,7 @@ class TestCollector:
         assert plans["4"]["plan"] == LAPSED
 
     def test_lands_in_the_switchers_own_backup_dir(self, switcher, monkeypatch):
-        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: TEAM)
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(TEAM))
         switcher._collect_subscription_plans(
             [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
         )
@@ -554,3 +741,37 @@ class TestTuiMarker:
 
     def test_nothing_without_a_record(self):
         assert self._render(None) == ""
+
+
+class TestSnapshotSourceRefresh:
+    def _source(self, refresh):
+        from claude_swap.snapshot_source import SnapshotSource
+
+        class Switcher:
+            refresh_subscription_plans = staticmethod(refresh)
+
+        return SnapshotSource(Switcher())
+
+    def test_overlapping_refreshes_collapse(self):
+        calls = []
+        holder = {}
+
+        def refresh():
+            calls.append(1)
+            holder["source"].refresh_plans()
+
+        holder["source"] = self._source(refresh)
+        holder["source"].refresh_plans()
+        assert calls == [1]
+
+    def test_a_failure_goes_no_further_and_releases(self):
+        calls = []
+
+        def refresh():
+            calls.append(1)
+            raise RuntimeError("keychain")
+
+        source = self._source(refresh)
+        source.refresh_plans()
+        source.refresh_plans()
+        assert len(calls) == 2

@@ -1791,6 +1791,38 @@ class ClaudeAccountSwitcher:
             accounts_info, fetch=fetch, scheduled=scheduled
         )
 
+    def _subscription_store(self) -> subscription.PlanStore:
+        return subscription.PlanStore(
+            self.backup_dir / "cache" / subscription.PLAN_FILENAME,
+            clock=self._usage_store.clock,
+        )
+
+    def _stored_subscription_plans(
+        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+    ) -> dict[str, dict]:
+        """Per-slot plan records as stored. Touches no credential or network."""
+        records = self._subscription_store().load()
+        plans: dict[str, dict] = {}
+        for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info:
+            record = records.get(subscription.identity_key(email, org_uuid))
+            if subscription.valid_record(record):
+                plans[str(num)] = record
+        return plans
+
+    def _plans_for_pass(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str, str]],
+        fetch: set[str] | None,
+    ) -> dict[str, dict]:
+        """An empty ``fetch`` set means no network eligibility, for plans too."""
+        if fetch is not None and not fetch:
+            return self._stored_subscription_plans(accounts_info)
+        return self._collect_subscription_plans(accounts_info)
+
+    def refresh_subscription_plans(self) -> None:
+        """Refresh due plans for surfaces whose snapshots are store-only."""
+        self._collect_subscription_plans(self._build_accounts_info())
+
     def _collect_subscription_plans(
         self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
     ) -> dict[str, dict]:
@@ -1802,41 +1834,49 @@ class ClaudeAccountSwitcher:
         have changed. Only an already-valid access token is used; a due slot
         without one keeps its last record and is retried on the next pass.
 
-        Network happens here with no lock held. Returns only slots that have a
-        usable record, so a slot never fetched is simply absent.
+        A read that fails, or that belongs to some other account, records when
+        it may be repeated and changes nothing else. Network happens here with
+        no lock held. Returns only slots that have a usable record, so a slot
+        never fetched is simply absent.
         """
-        store = subscription.PlanStore(
-            self.backup_dir / "cache" / subscription.PLAN_FILENAME,
-            clock=self._usage_store.clock,
-        )
+        store = self._subscription_store()
         records = store.load()
-        now = store.clock()
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
         updates: dict[str, dict] = {}
-        plans: dict[str, dict] = {}
         for num, email, _org_name, org_uuid, is_active, creds, _alias in accounts_info:
             key = subscription.identity_key(email, org_uuid)
-            record = records.get(key)
-            if subscription.is_due(record, now):
-                token = subscription.usable_access_token(creds)
-                if token is None and not is_active:
-                    # accounts_info was read before the usage pass, which may
-                    # have refreshed and persisted this slot's token since.
-                    token = subscription.usable_access_token(
-                        self._read_account_credentials(str(num), email)
-                    )
-                if token is not None:
-                    fetched = subscription.fetch_plan(token)
-                    if fetched is not None:
-                        record = {"plan": fetched, "fetchedAt": now}
-                        updates[key] = record
-            if subscription.valid_record(record):
-                plans[str(num)] = record
+            if not subscription.is_due(records.get(key), store.clock()):
+                continue
+            token = subscription.usable_access_token(creds)
+            if token is None and not is_active:
+                # accounts_info was read before the usage pass, which may have
+                # refreshed this slot since; its backup write invalidates the
+                # display cache, so the cached read still sees that token.
+                token = subscription.usable_access_token(
+                    self._read_account_credentials(str(num), email, cached=True)
+                )
+            if token is None:
+                continue
+            started_at = store.clock()
+            fetched = subscription.fetch_plan(token)
+            slot_uuid = (accounts.get(str(num), {}).get("uuid") or "").strip()
+            if fetched.plan is not None and subscription.matches_slot(
+                fetched, slot_uuid, org_uuid
+            ):
+                updates[key] = {"plan": fetched.plan, "fetchedAt": started_at}
+            else:
+                updates[key] = {
+                    "retryAt": subscription.next_retry_at(
+                        started_at, fetched.retry_after_s
+                    ),
+                    "attemptedAt": started_at,
+                }
         if updates:
             try:
                 store.save(updates)
-            except OSError as e:
+            except (OSError, LockError) as e:
                 self._logger.debug("Could not save subscription plans: %r", e)
-        return plans
+        return self._stored_subscription_plans(accounts_info)
 
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
@@ -1851,7 +1891,7 @@ class ClaudeAccountSwitcher:
         """
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
-        plans = self._collect_subscription_plans(accounts_info)
+        plans = self._plans_for_pass(accounts_info, fetch)
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
@@ -5898,7 +5938,7 @@ class ClaudeAccountSwitcher:
 
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
-        plans = self._collect_subscription_plans(accounts_info)
+        plans = self._plans_for_pass(accounts_info, fetch)
 
         if json_output:
             return self._build_list_payload(accounts_info, entries, plans)

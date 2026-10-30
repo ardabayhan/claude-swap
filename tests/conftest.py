@@ -575,8 +575,10 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     # Same endpoint, same rule: the plan collector runs on every `list` and
     # TUI snapshot, and test credentials carry an access token with no
     # `expiresAt`, which reads as valid — so it would otherwise go live too.
+    from claude_swap import subscription
+
     monkeypatch.setattr(
-        "claude_swap.subscription.fetch_plan", lambda token, *a, **k: None
+        subscription, "fetch_plan", lambda token, *a, **k: subscription.PlanFetch()
     )
     yield
 
